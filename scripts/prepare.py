@@ -16,7 +16,7 @@ import sys
 import unicodedata
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urljoin
 
 from bs4 import BeautifulSoup
 from markdown_it import MarkdownIt
@@ -104,7 +104,15 @@ class FileResolver:
         raise ValueError("Not found in exported files")
 
 
-def prepare(pages, files, out, encoding=None, overrides=None):
+def prepare(pages, files, out, encoding=None, overrides=None,
+            allow_broken_links=False, pbworks_base_url=None):
+    if allow_broken_links:
+        base = urlsplit(pbworks_base_url or "")
+        if (base.scheme not in {"http", "https"} or not base.hostname
+                or base.username or base.password or base.query or base.fragment
+                or base.path not in {"", "/"}):
+            raise ValueError("--allow-broken-links requires --pbworks-base-url "
+                             "with the original wiki origin, e.g. https://wiki.pbworks.com")
     pages, files, out = pages.resolve(), files.resolve(), out.absolute()
     if not pages.is_dir() or not files.is_dir():
         raise ValueError("Both source trees must exist")
@@ -113,7 +121,8 @@ def prepare(pages, files, out, encoding=None, overrides=None):
     if out.exists() or pages in out.parents or files in out.parents:
         raise ValueError("Output must be a NEW directory outside both source trees")
     out.mkdir(parents=True)
-    report = {"errors": [], "warnings": [], "normalization": {}, "references": []}
+    report = {"errors": [], "warnings": [], "normalization": {}, "references": [],
+              "broken_links": []}
     report["normalization"]["pages"] = copy_normalized(pages, out / "html", encoding)
     report["normalization"]["files"] = copy_normalized(files, out / "files", encoding)
     htmls = sorted(p for p in (out / "html").rglob("*")
@@ -185,7 +194,29 @@ def prepare(pages, files, out, encoding=None, overrides=None):
                     tokens[token] = {"path": file_rel, "fragment": u.fragment}
                     tag[attr] = token
             except ValueError as e:
-                report["errors"].append({"page": rel, "href": href, "reason": str(e)})
+                # Missing anchors may be pre-existing damage in the source wiki.
+                # Preserve as an ordinary absolute HTTP(S) link so the importer
+                # won't attempt to resolve it as a page or an attachment.
+                missing = str(e) in {"Page missing from export",
+                                     "Not found in exported files"}
+                if allow_broken_links and tag.name == "a" and missing:
+                    source_url = urljoin(pbworks_base_url.rstrip("/") + "/",
+                                         quote(rel, safe="/"))
+                    preserved = urljoin(source_url, href)
+                    # Schemes other than HTTP(S) must never enter via this bypass.
+                    if urlsplit(preserved).scheme not in {"http", "https"}:
+                        report["errors"].append({"page": rel, "href": href,
+                                                 "reason": str(e)})
+                        continue
+                    tag[attr] = preserved
+                    record = {"page": md_paths[rel], "source_html": rel,
+                              "href": href, "preserved_url": preserved,
+                              "reason": str(e)}
+                    report["broken_links"].append(record)
+                    report["warnings"].append({
+                        **record, "warning": "Broken source link preserved for manual repair"})
+                else:
+                    report["errors"].append({"page": rel, "href": href, "reason": str(e)})
         # Rewrite only staging copies. Source files and timestamps remain untouched.
         p.write_text(str(soup), encoding="utf-8")
         os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -232,6 +263,8 @@ def prepare(pages, files, out, encoding=None, overrides=None):
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     (out / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+    (out / "broken_links.json").write_text(
+        json.dumps(report["broken_links"], indent=2, ensure_ascii=False) + "\n")
     (out / "conversion_report.json").write_text(json.dumps(conversions, indent=2, ensure_ascii=False) + "\n")
     return manifest, report
 
@@ -243,12 +276,20 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--from-encoding", help="Only for non-UTF-8 filename bytes, e.g. cp1252")
     ap.add_argument("--overrides", type=Path, help='JSON: {"source.html::old URL": "files/path"}')
+    ap.add_argument("--allow-broken-links", action="store_true",
+                    help="Preserve missing anchor targets as absolute original-wiki URLs; "
+                         "requires --pbworks-base-url. Images and ambiguous targets stay errors.")
+    ap.add_argument("--pbworks-base-url",
+                    help="Original wiki origin, e.g. https://example.pbworks.com")
     args = ap.parse_args()
     try:
         m, r = prepare(args.pages, args.files, args.out, args.from_encoding,
-                       json.loads(args.overrides.read_text()) if args.overrides else {})
+                       json.loads(args.overrides.read_text()) if args.overrides else {},
+                       args.allow_broken_links, args.pbworks_base_url)
         print(json.dumps(m["counts"], indent=2))
         print(f"Errors: {len(r['errors'])}; warnings: {len(r['warnings'])}; see report.json")
+        if r["broken_links"]:
+            print(f"Preserved broken links: {len(r['broken_links'])}; see broken_links.json")
         return 0 if m["ready"] else 1
     except (ValueError, OSError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

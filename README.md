@@ -109,6 +109,40 @@ sowie relative HTML-Dateilinks werden unterstützt.
 - `manifest.json`: Anzahlen und Dateimengen gegen den Export abgleichen.
 - Einige Markdown-Seiten lokal öffnen; Text, Tabellen und Bilder kontrollieren.
 
+### Bereits kaputte Links beibehalten
+
+Wenn der Export bereits Links auf nicht vorhandene Seiten oder Dateien enthält,
+können diese ausdrücklich als Warnungen statt als Fehler übernommen werden:
+
+```bash
+uv run python scripts/prepare.py \
+  --pages /export/pbworks-pages \
+  --files /export/pbworks-files \
+  --out /migration/bundle-neu \
+  --allow-broken-links \
+  --pbworks-base-url https://MEIN-WIKI.pbworks.com
+```
+
+Die Linkbeschriftung bleibt erhalten. Fehlende Linkziele werden als absolute URLs
+zum ursprünglichen Wiki gespeichert, inklusive Query-String und Fragment.
+Dadurch versucht der Collectives-Importer nicht, sie als lokale Seiten aufzulösen.
+Die Links sind weiterhin gegebenenfalls kaputt; sie werden **nicht** repariert.
+In `broken_links.json` stehen die Markdown-Seite, ursprüngliche URL, übernommene
+URL und der Grund für eine spätere manuelle Korrektur im Collective.
+Auch `report.json` enthält diese Liste und die zugehörigen Warnungen.
+
+`--pbworks-base-url` muss die ursprüngliche Wiki-Origin ohne Seitenpfad sein.
+Relative Exportlinks werden gegenüber dem Pfad ihrer HTML-Quelldatei unter
+dieser Origin aufgelöst. Falls dieser Exportpfad nicht dem historischen
+Wiki-Pfad entspricht, dient die resultierende URL nur als Reparaturhinweis;
+der unveränderte Original-Link steht ebenfalls in `broken_links.json`.
+
+Diese Option gilt nur für fehlende **normale Links** (`<a href>`). Fehlende Bilder,
+mehrdeutige Dateizuordnungen, ungültiges UTF-8 und sonstige Integritätsfehler
+blockieren weiterhin. Ohne die Option bleibt das bisherige strikte Verhalten.
+Für einen erneuten Prepare-Lauf immer einen neuen Bundle-Ordner verwenden,
+statt `ready` oder Prüfsummen im alten Manifest zu ändern.
+
 `ready: false` blockiert die Server-Schritte. Roh-HTML-Links/-Bilder in komplexen
 Tabellen werden bewusst als Fehler gemeldet: Der Collectives-Importer verarbeitet
 keine beliebigen HTML-Anhänge. Solche Fälle in einer **Arbeitskopie des Exports**

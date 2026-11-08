@@ -125,6 +125,56 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NEW"):
             prepare(self.pages, self.files, self.out)
 
+    def test_broken_links_preserved_as_absolute_urls(self):
+        self.write(self.pages, "deep/Start.html",
+                   '<a href="/w/page/123/Missing%20Page#part">Old page</a>'
+                   '<a href="../missing.pdf?download=1">Missing file</a>')
+        m, r = prepare(self.pages, self.files, self.out, allow_broken_links=True,
+                       pbworks_base_url="https://wiki.pbworks.com")
+        self.assertTrue(m["ready"])
+        self.assertEqual(len(r["broken_links"]), 2)
+        self.assertEqual(r["errors"], [])
+        content = (self.out / "collective/deep/Start.md").read_text()
+        self.assertIn("https://wiki.pbworks.com/w/page/123/Missing%20Page#part", content)
+        self.assertIn("https://wiki.pbworks.com/missing.pdf?download=1", content)
+        self.assertIn("Old page", content)
+        self.assertEqual(r["broken_links"],
+                         json.loads((self.out / "broken_links.json").read_text()))
+        validate(self.out)
+        index = self.out / "files-index.json"
+        index.write_text('{"complete":true,"files":{}}')
+        dest = finalize(self.out, index, "https://cloud.example.org")
+        self.assertEqual(content, (dest / "deep/Start.md").read_text())
+
+    def test_missing_page_still_blocks_by_default(self):
+        self.write(self.pages, "Start.html", '<a href="/w/page/123/Missing">Old</a>')
+        m, r = prepare(self.pages, self.files, self.out)
+        self.assertFalse(m["ready"])
+        self.assertEqual(r["broken_links"], [])
+
+    def test_broken_images_still_block_in_permissive_mode(self):
+        self.write(self.pages, "Start.html", '<img src="/f/missing.png">')
+        m, r = prepare(self.pages, self.files, self.out, allow_broken_links=True,
+                       pbworks_base_url="https://wiki.pbworks.com")
+        self.assertFalse(m["ready"])
+        self.assertEqual(r["broken_links"], [])
+
+    def test_ambiguous_file_still_blocks_in_permissive_mode(self):
+        self.write(self.pages, "Start.html", '<a href="/f/x.pdf">File</a>')
+        self.write(self.files, "a/x.pdf", "one")
+        self.write(self.files, "b/x.pdf", "two")
+        m, r = prepare(self.pages, self.files, self.out, allow_broken_links=True,
+                       pbworks_base_url="https://wiki.pbworks.com")
+        self.assertFalse(m["ready"])
+        self.assertIn("Ambiguous", r["errors"][0]["reason"])
+
+    def test_broken_link_mode_requires_origin(self):
+        for base in [None, "file:///tmp", "https://user:pass@wiki.pbworks.com",
+                     "https://wiki.pbworks.com/path"]:
+            with self.assertRaisesRegex(ValueError, "original wiki origin"):
+                prepare(self.pages, self.files, self.out, allow_broken_links=True,
+                        pbworks_base_url=base)
+
 
 if __name__ == "__main__":
     unittest.main()
