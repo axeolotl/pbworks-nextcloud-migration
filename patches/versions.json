@@ -1,0 +1,12 @@
+{
+  "df2921ec933355be651d2e77ae3c62ae596db0f7ec0a5cde09717e6377403c80": {
+    "patch": "collectives-4.5-4.7.patch",
+    "patched_sha256": "770c1df1be84f5eb3ac6e43f2a4b183c5b99670d9c6f18e05a0c6f684eac9824",
+    "version_family": "4.5-4.7"
+  },
+  "7f6e96c344b4b74dc1d62a465799701744964e2ea323285d977335a247a67330": {
+    "patch": "collectives-4.8.patch",
+    "patched_sha256": "770c1df1be84f5eb3ac6e43f2a4b183c5b99670d9c6f18e05a0c6f684eac9824",
+    "version_family": "4.8"
+  }
+}

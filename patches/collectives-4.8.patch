@@ -1,0 +1,379 @@
+--- a/lib/Service/ImportService.php
++++ b/lib/Service/ImportService.php
+@@ -20,6 +20,13 @@
+ class ImportService {
+ 	private int $count = 0;
+ 	private array $fileMap = []; // Maps original file paths to new	page IDs
++	// Import link patch: normalized source paths => page IDs (files and directories)
++	private array $pathLookup = [];
++	private array $pathLookupLower = [];
++	private int $linksUpdated = 0;
++	private int $linksFailed = 0;
++	private int $attachmentsUpdated = 0;
++	private int $attachmentsFailed = 0;
+ 
+ 	public function __construct(
+ 		private readonly PageService $pageService,
+@@ -61,6 +68,8 @@
+ 
+ 		// Third pass: rewrite relative links in all imported pages
+ 		$this->rewriteInternalLinksAndAttachments($parentId, $directory);
++		$this->progressReporter->writeInfo(sprintf('Link summary: %d links updated, %d links not updated; %d attachments updated, %d attachments not found',
++			$this->linksUpdated, $this->linksFailed, $this->attachmentsUpdated, $this->attachmentsFailed));
+ 		$message = sprintf('Memory usage after rewriting links and attachments: %.2fMB (+%.2fMb, peak usage: %.2fMB)',
+ 			(float)memory_get_usage() / 1024.0 / 1024.0,
+ 			((float)memory_get_usage() - (float)$memory) / 1024.0 / 1024.0,
+@@ -78,7 +87,7 @@
+ 			return;
+ 		}
+ 
+-		$parentId = $parentPage?->getId() ?? 0;
++		$parentId = $parentPage !== null ? $parentPage->getId() : 0;
+ 		$items = scandir($directory);
+ 		if ($items === false) {
+ 			throw new NotFoundException('Unable to read directory: ' . $directory);
+@@ -88,10 +97,15 @@
+ 		$mdFiles = array_filter($items, static fn ($item) => is_file($directory . DIRECTORY_SEPARATOR . $item) && strtolower(pathinfo($item, PATHINFO_EXTENSION)) === 'md');
+ 		foreach ($mdFiles as $item) {
+ 			$path = $directory . DIRECTORY_SEPARATOR . $item;
++			// A directory README was already imported as its index by our caller.
++			if (isset($this->fileMap[$path])) {
++				continue;
++			}
+ 
+ 			try {
+ 				[$id, $title] = $this->processFile($directory, $item, $parentPage);
+ 				$this->fileMap[$path] = $id;
++				$this->registerPath($path, $id);
+ 				$this->count++;
+ 				$this->progressReporter->writeInfo(sprintf('✓ Imported #%d: %s - %s (pageId: %d)', $this->count, $path, $title, $id));
+ 			} catch (NotFoundException $e) {
+@@ -110,6 +124,7 @@
+ 				try {
+ 					[$id, $title] = $this->processFile($path, $readmeName, $parentPage, $item);
+ 					$this->fileMap[$path . DIRECTORY_SEPARATOR . $readmeName] = $id;
++					$this->registerPath($path . DIRECTORY_SEPARATOR . $readmeName, $id);
+ 					$this->count++;
+ 					$this->progressReporter->writeInfo(sprintf('✓ Imported #%d: %s - %s (pageId: %d)', $this->count, $path . DIRECTORY_SEPARATOR . $readmeName, $title, $id));
+ 				} catch (NotFoundException $e) {
+@@ -121,13 +136,15 @@
+ 				// Create new empty index page
+ 				$indexPageInfo = $this->pageService->getOrCreate($this->collective->getId(), $parentId, $item, $this->user->getUID());
+ 			}
++			// A link to the directory itself points to its index page
++			$this->registerPath($path, $indexPageInfo->getId());
+ 			$this->processDirectory($path, $indexPageInfo);
+ 		}
+ 	}
+ 
+ 	private function processFile(string $directory, string $item, ?PageInfo $parentPage, ?string $title = null): array {
+ 		$path = $directory . DIRECTORY_SEPARATOR . $item;
+-		$parentId = $parentPage?->getId() ?? 0;
++		$parentId = $parentPage !== null ? $parentPage->getId() : 0;
+ 		$title ??= basename($path, '.md');
+ 		if (!is_readable($path)) {
+ 			throw new NotFoundException('File not readable');
+@@ -149,7 +166,7 @@
+ 			if (strtolower($title) === 'readme' && $parentId === 0) {
+ 				// Special case: use parent directory name as title for README.md files
+ 				$title = basename($directory);
+-				$parentId = $parentPage?->getParentId() ?? 0;
++				$parentId = $parentPage !== null ? $parentPage->getParentId() : 0;
+ 			}
+ 			$pageInfo = $this->pageService->createBase(
+ 				$this->collective->getId(),
+@@ -191,13 +208,24 @@
+ 
+ 			$links = MarkdownHelper::getLinksFromContent($content);
+ 			$linkCount = 0;
++			$seenHrefs = [];
+ 			foreach ($links as $link) {
++				// All occurrences of a href are replaced at once
++				if (isset($seenHrefs[$link['href']])) {
++					continue;
++				}
++				$seenHrefs[$link['href']] = true;
+ 				$linkCount += $this->processLink($link, $parentId, $filePath, $updatedContent);
+ 			}
+ 
+ 			$attachments = MarkdownHelper::getImageLinksFromContent($content);
+ 			$attachmentCount = 0;
++			$seenUrls = [];
+ 			foreach ($attachments as $attachment) {
++				if (isset($seenUrls[$attachment['url']])) {
++					continue;
++				}
++				$seenUrls[$attachment['url']] = true;
+ 				$attachmentCount += $this->processAttachment($attachment, $pageFile, $filePath, $baseDirectory, $updatedContent);
+ 			}
+ 
+@@ -252,49 +280,38 @@
+ 	private function processLink(array $link, int $parentId, string $filePath, string &$updatedContent): int {
+ 		$href = $link['href'];
+ 		$sanitizedHref = self::sanitizeHref($href);
+-		if ($sanitizedHref === null) {
+-			return 0;
+-		}
+-
+-		$candidates = [];
+-
+-		// Consider link with and without .md extension
+-		if (str_ends_with($sanitizedHref, '.md')) {
+-			$candidates[] = $sanitizedHref;
+-			$candidates[] = substr($sanitizedHref, 0, -3); // without .md
+-		} else {
+-			$candidates[] = $sanitizedHref;
+-			$candidates[] = $sanitizedHref . '.md';
+-		}
+-
+-		// E.g. Dokuwiki2Markdown generates links where pages are separated with colons
+-		if (str_contains($sanitizedHref, ':')) {
+-			$dokuwikiPath = self::getDokuwikiHref($sanitizedHref);
+-			$candidates[] = $dokuwikiPath;
+-
+-			// Add additional candidates by stripping leading path segments
+-			// It's an attempt to allow processing links even if a subdirectory gets imported
+-			$pathSegments = explode(DIRECTORY_SEPARATOR, $dokuwikiPath);
+-			for ($i = 1; $i < count($pathSegments); $i++) {
+-				$candidates[] = implode(DIRECTORY_SEPARATOR, array_slice($pathSegments, $i));
+-			}
+-		}
+-
+-		// Try to find target page
++		// Also skip pure in-page anchors like `#section` (empty after sanitizing)
++		if ($sanitizedHref === null || $sanitizedHref === '') {
++			return 0;
++		}
++
++		// Patched: resolve the (percent-decoded) link relative to the linking file
+ 		$targetPageInfo = null;
+-		foreach ($candidates as $candidate) {
++		$targetPageId = $this->lookupPath(dirname($filePath), $sanitizedHref);
++		if ($targetPageId !== null) {
+ 			try {
+-				$targetPageInfo = $this->pageService->findByPath($this->collective->getId(), $candidate, $this->user->getUID(), $parentId);
+-				break;
++				$targetPageInfo = $this->pageService->findByFileId($this->collective->getId(), $targetPageId, $this->user->getUID());
+ 			} catch (NotFoundException|NotPermittedException) {
+ 			}
+ 		}
++		if ($targetPageInfo !== null) {
++			return $this->replaceLinkWithPage($href, $targetPageInfo, $filePath, $updatedContent);
++		}
++
++		// No title/root fallback: a missing sibling must not link to another page.
+ 
+ 		if ($targetPageInfo === null) {
+-			$this->progressReporter->writeErrorVerbose(sprintf('✗ Failed: %s - Didn\'t find target page for link %s, not updated', $filePath, $href));
+-			return 0;
+-		}
+-
++			$this->linksFailed++;
++			$resolved = self::normalizePath(dirname($filePath) . DIRECTORY_SEPARATOR . rawurldecode($sanitizedHref));
++			$reason = is_file($resolved) ? 'target is not an imported Markdown page' : 'target not found';
++			$this->progressReporter->writeError(sprintf('✗ Unresolved link: %s - %s (%s: %s), not updated', $filePath, $href, $reason, $resolved));
++			return 0;
++		}
++
++		return $this->replaceLinkWithPage($href, $targetPageInfo, $filePath, $updatedContent);
++	}
++
++	private function replaceLinkWithPage(string $href, PageInfo $targetPageInfo, string $filePath, string &$updatedContent): int {
+ 		$newHref = $this->pageService->getPageLink($this->collective->getUrlPath(), $targetPageInfo);
+ 
+ 		// Preserve fragment if present
+@@ -302,11 +319,139 @@
+ 			$newHref .= '#' . $matches[1];
+ 		}
+ 
+-		// Replace the link in content
+-		$oldLink = '](' . $href . ')';
+-		$newLink = '](' . $newHref . ')';
+-		$updatedContent = str_replace($oldLink, $newLink, $updatedContent);
++		if (self::replaceDestination($href, $newHref, $updatedContent) === 0) {
++			$this->linksFailed++;
++			$this->progressReporter->writeError(sprintf('✗ Unreplaceable link: %s - %s (target found, but link syntax not supported, e.g. reference link)', $filePath, $href));
++			return 0;
++		}
++		$this->linksUpdated++;
+ 		return 1;
++	}
++
++	/**
++	 * Lexically normalize a path (resolve `.` and `..`, collapse separators)
++	 */
++	private static function normalizePath(string $path): string {
++		$isAbsolute = str_starts_with($path, '/');
++		$parts = [];
++		foreach (explode('/', $path) as $segment) {
++			if ($segment === '' || $segment === '.') {
++				continue;
++			}
++			if ($segment === '..') {
++				if ($parts !== [] && end($parts) !== '..') {
++					array_pop($parts);
++				} elseif (!$isAbsolute) {
++					$parts[] = '..';
++				}
++				continue;
++			}
++			$parts[] = $segment;
++		}
++		$normalized = ($isAbsolute ? '/' : '') . implode('/', $parts);
++		if (class_exists(\Normalizer::class)) {
++			$nfc = \Normalizer::normalize($normalized, \Normalizer::FORM_C);
++			if ($nfc !== false) {
++				$normalized = $nfc;
++			}
++		}
++		return $normalized;
++	}
++
++	private function registerPath(string $path, int $pageId): void {
++		$realPath = realpath($path);
++		$key = self::normalizePath($realPath !== false ? $realPath : $path);
++		$this->pathLookup[$key] = $pageId;
++		$lower = mb_strtolower($key, 'UTF-8');
++		// null marks an ambiguous case-insensitive match
++		$this->pathLookupLower[$lower] = array_key_exists($lower, $this->pathLookupLower) && $this->pathLookupLower[$lower] !== $pageId
++			? null
++			: $pageId;
++	}
++
++	/**
++	 * Find the page ID for a relative link, resolved against the directory of the linking file
++	 */
++	private function lookupPath(string $fromDirectory, string $sanitizedHref): ?int {
++		$realFrom = realpath($fromDirectory);
++		$base = $realFrom !== false ? $realFrom : $fromDirectory;
++		$target = self::normalizePath($base . '/' . rawurldecode($sanitizedHref));
++		$candidates = [$target];
++		if (!str_ends_with(strtolower($target), '.md')) {
++			$candidates[] = $target . '.md';
++		}
++		foreach ($candidates as $candidate) {
++			if (isset($this->pathLookup[$candidate])) {
++				return $this->pathLookup[$candidate];
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * Replace an inline link destination in the raw Markdown.
++	 * The parser returns the destination percent-encoded, so the raw text may contain
++	 * either the encoded or the decoded form, optionally in angle brackets and with a title.
++	 */
++	private static function replaceDestination(string $href, string $newHref, string &$content): int {
++		// Preserve code blocks, HTML blocks and inline code byte-for-byte.
++		$environment = new \League\CommonMark\Environment\Environment();
++		$environment->addExtension(new \League\CommonMark\Extension\CommonMark\CommonMarkCoreExtension());
++		$document = (new \League\CommonMark\Parser\MarkdownParser($environment))->parse($content);
++		$walker = $document->walker();
++		$lines = explode("\n", $content);
++		$protected = [];
++		while ($event = $walker->next()) {
++			$node = $event->getNode();
++			if ($event->isEntering() && (
++				$node instanceof \League\CommonMark\Extension\CommonMark\Node\Block\FencedCode
++				|| $node instanceof \League\CommonMark\Extension\CommonMark\Node\Block\IndentedCode
++				|| $node instanceof \League\CommonMark\Extension\CommonMark\Node\Block\HtmlBlock
++			)) {
++				for ($line = $node->getStartLine() - 1; $line < $node->getEndLine(); $line++) {
++					$protected[$line] = true;
++				}
++			}
++		}
++		$saved = [];
++		$prefix = 'MIGRATION_LITERAL_' . bin2hex(random_bytes(16)) . '_';
++		foreach (array_keys($protected) as $line) {
++			$key = $prefix . count($saved);
++			$saved[$key] = $lines[$line];
++			$lines[$line] = $key;
++		}
++		$working = implode("\n", $lines);
++		$working = preg_replace_callback('/(?<!`)(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)/',
++			static function ($m) use (&$saved, $prefix) {
++				$key = $prefix . count($saved);
++				$saved[$key] = $m[0];
++				return $key;
++			}, $working);
++		$total = self::replaceDestinationRaw($href, $newHref, $working);
++		$content = strtr($working, $saved);
++		return $total;
++	}
++
++	private static function replaceDestinationRaw(string $href, string $newHref, string &$content): int {
++		$forms = array_unique([$href, rawurldecode($href)]);
++		$total = 0;
++		foreach ($forms as $form) {
++			$quoted = preg_quote($form, '/');
++			$pattern = '/\]\(\s*(?:<' . $quoted . '>|' . $quoted . ')(?=\s|\))/u';
++			$result = preg_replace_callback($pattern, static fn () => '](' . $newHref, $content, -1, $count);
++			if ($result !== null) {
++				$content = $result;
++				$total += $count;
++			}
++			// Reference link definitions: `[label]: destination "title"`
++			$pattern = '/^( {0,3}\[[^\]\n]+\]:[ \t]*)(?:<' . $quoted . '>|' . $quoted . ')(?=\s|$)/mu';
++			$result = preg_replace_callback($pattern, static fn ($m) => $m[1] . $newHref, $content, -1, $count);
++			if ($result !== null) {
++				$content = $result;
++				$total += $count;
++			}
++		}
++		return $total;
+ 	}
+ 
+ 	private function processAttachment(array $image, File $pageFile, string $filePath, string $baseDirectory, string &$updatedContent): int {
+@@ -326,7 +471,8 @@
+ 		$realSiblingMediaDirectory = realpath(dirname($realBaseDirectory) . DIRECTORY_SEPARATOR . 'media');
+ 
+ 		$candidates = [];
+-		$candidates[] = $baseDirectory . DIRECTORY_SEPARATOR . $sanitizedHref;
++		// Patched: try relative to the linking file first, percent-decoded and as-is
++		$candidates[] = dirname($filePath) . DIRECTORY_SEPARATOR . rawurldecode($sanitizedHref);
+ 
+ 		if (str_contains($sanitizedHref, ':')) {
+ 			$dokuwikiPath = self::getDokuwikiHref($sanitizedHref);
+@@ -353,7 +499,8 @@
+ 					&& str_starts_with($realPath, $realSiblingMediaDirectory . DIRECTORY_SEPARATOR);
+ 
+ 				if (!$withinBaseDirectory && !$withinSiblingMediaDirectory) {
+-					$this->progressReporter->writeErrorVerbose(sprintf('✗ Blocked: %s - Attachment path escapes import directory: %s', $filePath, $realPath));
++					$this->attachmentsFailed++;
++					$this->progressReporter->writeError(sprintf('✗ Blocked: %s - Attachment path escapes import directory: %s', $filePath, $realPath));
+ 					return 0;
+ 				}
+ 				$targetAttachment = $realPath;
+@@ -362,7 +509,8 @@
+ 		}
+ 
+ 		if ($targetAttachment === null) {
+-			$this->progressReporter->writeErrorVerbose(sprintf('✗ Failed: %s - Didn\'t find source file for attachment reference %s, not updated', $filePath, $url));
++			$this->attachmentsFailed++;
++			$this->progressReporter->writeError(sprintf('✗ Unresolved attachment: %s - %s (source file not found), not updated', $filePath, $url));
+ 			return 0;
+ 		}
+ 
+@@ -371,11 +519,17 @@
+ 			basename($targetAttachment),
+ 			file_get_contents($targetAttachment) ?: '',
+ 		);
++		// AttachmentService returns a filesystem path, not a URL. Spaces and
++		// Unicode must be encoded before inserting it into Markdown.
++		$newUrl = implode('/', array_map('rawurlencode', explode('/', $newUrl)));
+ 
+ 		// Replace the attachment reference in content
+-		$oldLink = '](' . $url . ')';
+-		$newLink = '](' . $newUrl . ')';
+-		$updatedContent = str_replace($oldLink, $newLink, $updatedContent);
++		if (self::replaceDestination($url, $newUrl, $updatedContent) === 0) {
++			$this->attachmentsFailed++;
++			$this->progressReporter->writeError(sprintf('✗ Unreplaceable attachment: %s - %s (uploaded, but reference syntax not supported)', $filePath, $url));
++			return 0;
++		}
++		$this->attachmentsUpdated++;
+ 		return 1;
+ 	}
+ 
